@@ -67,6 +67,10 @@ func (nm *noopMetrics) PendingDABytes() float64 {
 	return 0.0
 }
 
+// AltDA fallback metrics
+func (*noopMetrics) RecordAltDAState(int)           {}
+func (*noopMetrics) RecordAltDAFailureCount(uint64) {}
+
 // ThrottlingMetrics is a noopMetrics that always returns a max value for PendingDABytes, to use in testing batcher
 // backlog throttling.
 type ThrottlingMetrics struct {

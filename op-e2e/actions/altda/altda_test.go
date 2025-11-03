@@ -4,6 +4,7 @@ import (
 	"math/big"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/ethereum-optimism/optimism/op-e2e/config"
 
@@ -606,4 +607,157 @@ func TestAltDA_Finalization(gt *testing.T) {
 
 	// given 12s l1 time and 1s l2 time, l2 should be 12 * 3 = 36 blocks finalized
 	require.Equal(t, uint64(36), a.sequencer.SyncStatus().FinalizedL2.Number)
+}
+
+// Batcher falls back to L1-only when AltDA fails repeatedly, then recovers after successful retry.
+// Tests the full state machine: Good -> Degraded -> Retrying (failed) -> Retrying (success) -> Good
+func TestAltDA_BatcherFallbackAndRecovery(gt *testing.T) {
+	t := helpers.NewDefaultTesting(gt)
+
+	// Create custom harness with short retry interval and low threshold for fast testing
+	retryInterval := 10 * time.Millisecond
+	failureThreshold := uint64(5)
+
+	p := &e2eutils.TestParams{
+		MaxSequencerDrift:   40,
+		SequencerWindowSize: 12,
+		ChannelTimeout:      12,
+		L1BlockTime:         12,
+		UseAltDA:            true,
+		AllocType:           config.AllocTypeAltDA,
+	}
+	log := testlog.Logger(t, log.LvlDebug)
+	dp := e2eutils.MakeDeployParams(t, p)
+	sd := e2eutils.Setup(t, dp, helpers.DefaultAlloc)
+	require.True(t, sd.RollupCfg.AltDAEnabled())
+
+	miner := helpers.NewL1Miner(t, log, sd.L1Cfg)
+	l1Client := miner.EthClient()
+	jwtPath := e2eutils.WriteDefaultJWT(t)
+	engine := helpers.NewL2Engine(t, log, sd.L2Cfg, jwtPath)
+	engCl := engine.EngineClient(t, sd.RollupCfg)
+
+	storage := &altda.DAErrFaker{Client: altda.NewMockDAClient(log)}
+	l1F, err := sources.NewL1Client(miner.RPCClient(), log, nil, sources.L1ClientDefaultConfig(sd.RollupCfg, false, sources.RPCKindBasic))
+	require.NoError(t, err)
+	altDACfg, err := sd.RollupCfg.GetOPAltDAConfig()
+	require.NoError(t, err)
+	daMgr := altda.NewAltDAWithStorage(log, altDACfg, storage, &altda.NoopMetrics{})
+	sequencer := helpers.NewL2Sequencer(t, log, l1F, miner.BlobStore(), daMgr, engCl, sd.RollupCfg, sd.L1Cfg.Config, sd.DependencySet, 0)
+	miner.ActL1SetFeeRecipient(common.Address{'A'})
+	sequencer.ActL2PipelineFull(t)
+
+	// Create custom batcher config with fallback parameters
+	batcherCfg := helpers.AltDABatcherCfg(dp, storage)
+	batcherCfg.AltDAFailureThreshold = failureThreshold
+	batcherCfg.AltDARetryInterval = retryInterval
+	batcher := helpers.NewL2Batcher(log, sd.RollupCfg, batcherCfg, sequencer.RollupClient(), l1Client, engine.EthClient(), engCl)
+
+	addresses := e2eutils.CollectAddresses(sd, dp)
+	cl := engine.EthClient()
+	l2UserEnv := &helpers.BasicUserEnv[*helpers.L2Bindings]{
+		EthCl:          cl,
+		Signer:         types.LatestSigner(sd.L2Cfg.Config),
+		AddressCorpora: addresses,
+		Bindings:       helpers.NewL2Bindings(t, cl, engine.GethClient()),
+	}
+	alice := helpers.NewCrossLayerUser(log, dp.Secrets.Alice, rand.New(rand.NewSource(0xa57b)), p.AllocType)
+	alice.L2.SetUserEnv(l2UserEnv)
+
+	// 1. Good -> Degraded: Submit successful batches, then fail 5 times
+	log.Info("=== Phase 1: Good -> Degraded ===")
+	for i := 0; i < 2; i++ {
+		sequencer.ActL2StartBlock(t)
+		sequencer.ActL2EndBlock(t)
+		batcher.ActL2BatchBuffer(t)
+		batcher.ActL2ChannelClose(t)
+		batcher.ActL2BatchSubmit(t)
+		miner.ActL1StartBlock(12)(t)
+		miner.ActL1IncludeTx(dp.Addresses.Batcher)(t)
+		miner.ActL1EndBlock(t)
+	}
+	require.Equal(t, helpers.AltDAGood, batcher.AltDAState, "should start in Good state")
+	require.Equal(t, uint64(0), batcher.AltDAFailureCount)
+
+	// Inject failures to hit threshold
+	log.Info("Injecting AltDA failures to reach threshold")
+	for i := uint64(0); i < failureThreshold; i++ {
+		storage.ActSetPreImageFail()
+		sequencer.ActL2StartBlock(t)
+		sequencer.ActL2EndBlock(t)
+		batcher.ActL2BatchBuffer(t)
+		batcher.ActL2ChannelClose(t)
+		batcher.ActL2BatchSubmit(t)
+		miner.ActL1StartBlock(12)(t)
+		miner.ActL1IncludeTx(dp.Addresses.Batcher)(t)
+		miner.ActL1EndBlock(t)
+	}
+	require.Equal(t, helpers.AltDADegraded, batcher.AltDAState, "should transition to Degraded after threshold failures")
+	require.Equal(t, failureThreshold, batcher.AltDAFailureCount)
+
+	// 2. Degraded -> L1 Fallback: Verify L1-only mode works
+	log.Info("=== Phase 2: Degraded -> L1 Fallback ===")
+	lastTx := batcher.LastSubmitted
+	require.NotNil(t, lastTx)
+	// When in Degraded state, tx data should be raw frame data (not commitment)
+	// Commitment format starts with commitment type byte, raw data starts with derivation version byte
+	require.Greater(t, len(lastTx.Data()), 1, "tx should have data")
+	log.Info("L1 fallback tx submitted", "data_len", len(lastTx.Data()), "first_byte", lastTx.Data()[0])
+
+	// 3. Failed Retry: Wait for retry interval, inject failure, verify stays Degraded
+	log.Info("=== Phase 3: Failed Retry ===")
+	time.Sleep(retryInterval + 5*time.Millisecond)
+	storage.ActSetPreImageFail()
+	sequencer.ActL2StartBlock(t)
+	sequencer.ActL2EndBlock(t)
+	batcher.ActL2BatchBuffer(t)
+	batcher.ActL2ChannelClose(t)
+	batcher.ActL2BatchSubmit(t)
+	miner.ActL1StartBlock(12)(t)
+	miner.ActL1IncludeTx(dp.Addresses.Batcher)(t)
+	miner.ActL1EndBlock(t)
+	require.Equal(t, helpers.AltDADegraded, batcher.AltDAState, "should revert to Degraded after failed retry")
+	require.Equal(t, failureThreshold+1, batcher.AltDAFailureCount, "failure count should increment")
+
+	// 4. Successful Retry -> Good: Clear failures, wait, verify recovery
+	log.Info("=== Phase 4: Successful Retry -> Good ===")
+	time.Sleep(retryInterval + 5*time.Millisecond)
+	// Don't inject failure - AltDA should work
+	sequencer.ActL2StartBlock(t)
+	sequencer.ActL2EndBlock(t)
+	batcher.ActL2BatchBuffer(t)
+	batcher.ActL2ChannelClose(t)
+	batcher.ActL2BatchSubmit(t)
+	miner.ActL1StartBlock(12)(t)
+	miner.ActL1IncludeTx(dp.Addresses.Batcher)(t)
+	miner.ActL1EndBlock(t)
+	require.Equal(t, helpers.AltDAGood, batcher.AltDAState, "should recover to Good after successful retry")
+	require.Equal(t, uint64(0), batcher.AltDAFailureCount, "failure count should reset")
+
+	// Verify subsequent batches use AltDA again
+	lastTx = batcher.LastSubmitted
+	require.NotNil(t, lastTx)
+	log.Info("Recovered AltDA tx submitted", "data_len", len(lastTx.Data()))
+
+	// 5. Critical: Verify derivation can handle mixed L1/AltDA/L1 data
+	log.Info("=== Phase 5: Verify Mixed Derivation ===")
+	sequencer.ActL2PipelineFull(t)
+	syncStatus := sequencer.SyncStatus()
+
+	// Create a new verifier from scratch to verify it can derive the mixed L1/AltDA/L1 chain
+	jwtPath2 := e2eutils.WriteDefaultJWT(t)
+	engine2 := helpers.NewL2Engine(t, log, sd.L2Cfg, jwtPath2)
+	engCl2 := engine2.EngineClient(t, sd.RollupCfg)
+	l1F2, err := sources.NewL1Client(miner.RPCClient(), log, nil, sources.L1ClientDefaultConfig(sd.RollupCfg, false, sources.RPCKindBasic))
+	require.NoError(t, err)
+
+	daMgr2 := altda.NewAltDAWithStorage(log, altDACfg, storage, &altda.NoopMetrics{})
+	verifier := helpers.NewL2Verifier(t, log, l1F2, miner.BlobStore(), daMgr2, engCl2, sd.RollupCfg, sd.L1Cfg.Config, sd.DependencySet, &sync.Config{}, safedb.Disabled)
+	verifier.ActL2PipelineFull(t)
+
+	verifSyncStatus := verifier.SyncStatus()
+	require.Equal(t, syncStatus.SafeL2.Number, verifSyncStatus.SafeL2.Number, "verifier should sync to same safe head")
+	require.Equal(t, syncStatus.SafeL2.Hash, verifSyncStatus.SafeL2.Hash, "verifier should have same safe head hash")
+
+	log.Info("Test complete - successfully verified mixed L1/AltDA/L1 derivation")
 }

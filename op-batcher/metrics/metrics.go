@@ -65,6 +65,10 @@ type Metricer interface {
 
 	RecordBlobUsedBytes(num int)
 
+	// AltDA fallback metrics
+	RecordAltDAState(state int) // 0=Good, 1=Degraded, 2=Retrying
+	RecordAltDAFailureCount(count uint64)
+
 	Document() []opmetrics.DocumentedMetric
 
 	PendingDABytes() float64
@@ -122,6 +126,10 @@ type Metrics struct {
 	pidControllerIntegral   prometheus.Gauge
 	pidControllerDerivative prometheus.Gauge
 	pidResponseTime         prometheus.Histogram
+
+	// AltDA fallback metrics
+	altDAState        prometheus.Gauge
+	altDAFailureCount prometheus.Gauge
 }
 
 var _ Metricer = (*Metrics)(nil)
@@ -297,6 +305,16 @@ func NewMetrics(procName string) *Metrics {
 			Namespace: ns,
 			Name:      "unsafe_da_bytes",
 			Help:      "The estimated number of unsafe DA bytes",
+		}),
+		altDAState: factory.NewGauge(prometheus.GaugeOpts{
+			Namespace: ns,
+			Name:      "altda_state",
+			Help:      "Current AltDA fallback state (0=Good, 1=Degraded, 2=Retrying)",
+		}),
+		altDAFailureCount: factory.NewGauge(prometheus.GaugeOpts{
+			Namespace: ns,
+			Name:      "altda_failure_count",
+			Help:      "Number of consecutive AltDA failures",
 		}),
 	}
 	m.pendingDABytesGaugeFunc = factory.NewGaugeFunc(prometheus.GaugeOpts{
@@ -510,4 +528,14 @@ func (m *Metrics) RecordThrottleControllerState(error, integral, derivative floa
 // RecordThrottleResponseTime records the response time of the PID controller
 func (m *Metrics) RecordThrottleResponseTime(duration time.Duration) {
 	m.pidResponseTime.Observe(duration.Seconds())
+}
+
+// RecordAltDAState records the current AltDA fallback state
+func (m *Metrics) RecordAltDAState(state int) {
+	m.altDAState.Set(float64(state))
+}
+
+// RecordAltDAFailureCount records the number of consecutive AltDA failures
+func (m *Metrics) RecordAltDAFailureCount(count uint64) {
+	m.altDAFailureCount.Set(float64(count))
 }

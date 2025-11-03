@@ -7,6 +7,8 @@ import (
 	"crypto/rand"
 	"io"
 	"math/big"
+	"sync"
+	"time"
 
 	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"
@@ -66,6 +68,10 @@ type BatcherCfg struct {
 	AltDA                AltDAInputSetter
 
 	EnableCellProofs bool
+
+	// AltDA fallback configuration
+	AltDAFailureThreshold uint64
+	AltDARetryInterval    time.Duration
 }
 
 func DefaultBatcherCfg(dp *e2eutils.DeployParams) *BatcherCfg {
@@ -93,6 +99,15 @@ type L2BlockRefs interface {
 	L2BlockRefByHash(ctx context.Context, hash common.Hash) (eth.L2BlockRef, error)
 }
 
+// AltDAState represents the state of the AltDA system
+type AltDAState int
+
+const (
+	AltDAGood AltDAState = iota
+	AltDADegraded
+	AltDARetrying
+)
+
 // L2Batcher buffers and submits L2 batches to L1.
 //
 // TODO: note the batcher shares little logic/state with actual op-batcher,
@@ -118,6 +133,12 @@ type L2Batcher struct {
 	BatcherAddr      common.Address
 
 	LastSubmitted *types.Transaction
+
+	// AltDA fallback state
+	altDAMutex           sync.Mutex
+	AltDAState           AltDAState
+	AltDAFailureCount    uint64
+	altDALastFailureTime time.Time
 }
 
 func NewL2Batcher(log log.Logger, rollupCfg *rollup.Config, batcherCfg *BatcherCfg, api SyncStatusAPI, l1 L1TxAPI, l2 BlocksAPI, engCl L2BlockRefs) *L2Batcher {
@@ -131,6 +152,63 @@ func NewL2Batcher(log log.Logger, rollupCfg *rollup.Config, batcherCfg *BatcherC
 		l2BatcherCfg:  batcherCfg,
 		l1Signer:      types.LatestSignerForChainID(rollupCfg.L1ChainID),
 		BatcherAddr:   crypto.PubkeyToAddress(batcherCfg.BatcherKey.PublicKey),
+		AltDAState:    AltDAGood,
+	}
+}
+
+// canUseAltDA checks if AltDA should be used for the current transaction
+func (s *L2Batcher) canUseAltDA() bool {
+	s.altDAMutex.Lock()
+	defer s.altDAMutex.Unlock()
+	return s.l2BatcherCfg.UseAltDA && s.AltDAState != AltDADegraded
+}
+
+// recordAltDASuccess resets the failure state on successful AltDA write
+func (s *L2Batcher) recordAltDASuccess() {
+	s.altDAMutex.Lock()
+	defer s.altDAMutex.Unlock()
+	s.AltDAState = AltDAGood
+	s.AltDAFailureCount = 0
+	s.log.Info("AltDA recovered", "failures_before_recovery", s.AltDAFailureCount)
+}
+
+// recordAltDAFailure tracks failures and transitions to Degraded if threshold is met
+func (s *L2Batcher) recordAltDAFailure() {
+	s.altDAMutex.Lock()
+	defer s.altDAMutex.Unlock()
+	s.AltDAFailureCount++
+	s.altDALastFailureTime = time.Now()
+
+	if s.AltDAFailureCount >= s.l2BatcherCfg.AltDAFailureThreshold {
+		s.AltDAState = AltDADegraded
+		s.log.Warn("AltDA degraded, falling back to L1",
+			"failure_count", s.AltDAFailureCount,
+			"threshold", s.l2BatcherCfg.AltDAFailureThreshold)
+	} else {
+		s.log.Info("AltDA failure recorded", "count", s.AltDAFailureCount, "threshold", s.l2BatcherCfg.AltDAFailureThreshold)
+	}
+}
+
+// shouldRetryAltDA checks if enough time has passed to retry AltDA
+func (s *L2Batcher) shouldRetryAltDA() bool {
+	s.altDAMutex.Lock()
+	defer s.altDAMutex.Unlock()
+	if s.AltDAState != AltDADegraded {
+		return false
+	}
+	if s.altDALastFailureTime.IsZero() {
+		return false
+	}
+	return time.Since(s.altDALastFailureTime) >= s.l2BatcherCfg.AltDARetryInterval
+}
+
+// transitionToRetrying moves from Degraded to Retrying state
+func (s *L2Batcher) transitionToRetrying() {
+	s.altDAMutex.Lock()
+	defer s.altDAMutex.Unlock()
+	if s.AltDAState == AltDADegraded {
+		s.AltDAState = AltDARetrying
+		s.log.Info("Attempting AltDA retry", "failure_count", s.AltDAFailureCount)
 	}
 }
 
@@ -341,10 +419,22 @@ func (s *L2Batcher) ActL2BatchSubmit(t Testing, txOpts ...func(tx *types.Dynamic
 }
 
 func (s *L2Batcher) ActL2BatchSubmitRaw(t Testing, payload []byte, txOpts ...func(tx *types.DynamicFeeTx)) {
-	if s.l2BatcherCfg.UseAltDA {
+	// Check if we should retry AltDA
+	if s.shouldRetryAltDA() {
+		s.transitionToRetrying()
+	}
+
+	// Try AltDA if enabled and not degraded
+	if s.canUseAltDA() {
 		comm, err := s.l2BatcherCfg.AltDA.SetInput(t.Ctx(), payload)
-		require.NoError(t, err, "failed to set input for altda")
-		payload = comm.TxData()
+		if err != nil {
+			s.log.Warn("AltDA SetInput failed", "err", err)
+			s.recordAltDAFailure()
+			// Fall through to use L1 fallback (raw payload)
+		} else {
+			s.recordAltDASuccess()
+			payload = comm.TxData()
+		}
 	}
 
 	nonce, err := s.l1.PendingNonceAt(t.Ctx(), s.BatcherAddr)

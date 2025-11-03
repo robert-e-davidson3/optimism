@@ -111,6 +111,11 @@ type BatchSubmitter struct {
 	txpoolState       TxPoolState
 	txpoolBlockedBlob bool
 
+	altDAMutex           sync.Mutex // guards altDAState, altDAFailureCount, and altDALastFailureTime
+	altDAState           AltDAState
+	altDAFailureCount    uint64
+	altDALastFailureTime time.Time
+
 	channelMgrMutex sync.Mutex // guards channelMgr and prevCurrentL1
 	channelMgr      *channelManager
 	prevCurrentL1   eth.L1BlockRef // cached CurrentL1 from the last syncStatus
@@ -170,6 +175,9 @@ func (l *BatchSubmitter) StartBatchSubmitting() error {
 	receiptsCh := make(chan txmgr.TxReceipt[txRef])
 
 	l.txpoolState = TxpoolGood // no need to lock mutex as no other routines yet exist
+	l.altDAState = AltDAGood   // no need to lock mutex as no other routines yet exist
+	l.altDAFailureCount = 0
+	l.altDALastFailureTime = time.Time{}
 
 	// Channels used to signal between the loops
 	unsafeBytesUpdated := make(chan int64, 1)
@@ -417,6 +425,23 @@ const (
 	TxpoolCancelPending
 )
 
+type AltDAState int
+
+const (
+	// AltDA states.  Possible state transitions:
+	//   AltDAGood -> AltDADegraded:
+	//     happens when consecutive AltDA failures exceed threshold.
+	//   AltDADegraded -> AltDARetrying:
+	//     happens after backoff timer expires and a retry attempt is made.
+	//   AltDARetrying -> AltDAGood:
+	//     happens when retry succeeds.
+	//   AltDARetrying -> AltDADegraded:
+	//     happens when retry fails, backoff timer is restarted.
+	AltDAGood AltDAState = iota
+	AltDADegraded
+	AltDARetrying
+)
+
 func (l *BatchSubmitter) unsafeDABytes() int64 {
 	l.channelMgrMutex.Lock()
 	defer l.channelMgrMutex.Unlock()
@@ -452,6 +477,95 @@ func (l *BatchSubmitter) setTxPoolState(txPoolState TxPoolState, txPoolBlockedBl
 	l.txpoolState = txPoolState
 	l.txpoolBlockedBlob = txPoolBlockedBlob
 	l.txpoolMutex.Unlock()
+}
+
+// canUseAltDA checks if AltDA should be used based on current state.
+// Returns true if AltDA is enabled and state is Good or Retrying.
+func (l *BatchSubmitter) canUseAltDA() bool {
+	if !l.Config.UseAltDA {
+		return false
+	}
+	l.altDAMutex.Lock()
+	defer l.altDAMutex.Unlock()
+	// Use AltDA if we're in Good state or actively Retrying
+	return l.altDAState == AltDAGood || l.altDAState == AltDARetrying
+}
+
+// recordAltDASuccess records a successful AltDA write and resets state to Good.
+func (l *BatchSubmitter) recordAltDASuccess() {
+	l.altDAMutex.Lock()
+	defer l.altDAMutex.Unlock()
+
+	if l.altDAState != AltDAGood {
+		l.Log.Info("AltDA recovered",
+			"previous_state", l.altDAState,
+			"failure_count", l.altDAFailureCount)
+	}
+
+	l.altDAState = AltDAGood
+	l.altDAFailureCount = 0
+	l.altDALastFailureTime = time.Time{}
+
+	// Record metrics
+	l.Metr.RecordAltDAState(int(AltDAGood))
+	l.Metr.RecordAltDAFailureCount(0)
+}
+
+// recordAltDAFailure records an AltDA failure and potentially transitions to Degraded state.
+func (l *BatchSubmitter) recordAltDAFailure() {
+	l.altDAMutex.Lock()
+	defer l.altDAMutex.Unlock()
+
+	l.altDAFailureCount++
+	l.altDALastFailureTime = time.Now()
+
+	if l.altDAFailureCount >= l.Config.AltDAFailureThreshold && l.altDAState != AltDADegraded {
+		l.Log.Warn("AltDA failure threshold exceeded, falling back to L1-only writes",
+			"failure_count", l.altDAFailureCount,
+			"threshold", l.Config.AltDAFailureThreshold)
+		l.altDAState = AltDADegraded
+	} else if l.altDAState == AltDARetrying {
+		// If we were retrying and it failed, go back to degraded
+		l.Log.Warn("AltDA retry failed, returning to degraded state",
+			"failure_count", l.altDAFailureCount)
+		l.altDAState = AltDADegraded
+	}
+
+	// Record metrics
+	l.Metr.RecordAltDAState(int(l.altDAState))
+	l.Metr.RecordAltDAFailureCount(l.altDAFailureCount)
+}
+
+// shouldRetryAltDA checks if enough time has passed to retry AltDA.
+// Should only be called when in Degraded state.
+func (l *BatchSubmitter) shouldRetryAltDA() bool {
+	l.altDAMutex.Lock()
+	defer l.altDAMutex.Unlock()
+
+	if l.altDAState != AltDADegraded {
+		return false
+	}
+
+	if l.altDALastFailureTime.IsZero() {
+		return false
+	}
+
+	return time.Since(l.altDALastFailureTime) >= l.Config.AltDARetryInterval
+}
+
+// transitionToRetrying transitions from Degraded to Retrying state.
+func (l *BatchSubmitter) transitionToRetrying() {
+	l.altDAMutex.Lock()
+	defer l.altDAMutex.Unlock()
+
+	if l.altDAState == AltDADegraded {
+		l.Log.Info("Attempting AltDA retry",
+			"time_since_failure", time.Since(l.altDALastFailureTime),
+			"failure_count", l.altDAFailureCount)
+		l.altDAState = AltDARetrying
+		// Record metrics
+		l.Metr.RecordAltDAState(int(AltDARetrying))
+	}
 }
 
 // syncAndPrune computes actions to take based on the current sync status, prunes the channel manager state
@@ -936,12 +1050,16 @@ func (l *BatchSubmitter) publishToAltDAAndL1(txdata txData, queue *txmgr.Queue[t
 				l.recordFailedDARequest(txdata.ID(), nil)
 			} else {
 				l.Log.Error("Failed to post input to Alt DA", "error", err)
+				// Record AltDA failure for fallback mechanism
+				l.recordAltDAFailure()
 				// requeue frame if we fail to post to the DA Provider so it can be retried
 				// note: this assumes that the da server caches requests, otherwise it might lead to resubmissions of the blobs
 				l.recordFailedDARequest(txdata.ID(), err)
 			}
 			return nil
 		}
+		// AltDA write succeeded, record success
+		l.recordAltDASuccess()
 		l.Log.Info("Set altda input", "commitment", comm, "tx", txdata.ID())
 		candidate := l.calldataTxCandidate(comm.TxData())
 		l.sendTx(txdata, false, candidate, queue, receiptsCh)
@@ -961,8 +1079,13 @@ func (l *BatchSubmitter) publishToAltDAAndL1(txdata txData, queue *txmgr.Queue[t
 func (l *BatchSubmitter) sendTransaction(txdata txData, queue *txmgr.Queue[txRef], receiptsCh chan txmgr.TxReceipt[txRef], daGroup *errgroup.Group) error {
 	var err error
 
-	// if Alt DA is enabled we post the txdata to the DA Provider and replace it with the commitment.
-	if l.Config.UseAltDA {
+	// Check if we should retry AltDA (transition from Degraded to Retrying)
+	if l.Config.UseAltDA && l.shouldRetryAltDA() {
+		l.transitionToRetrying()
+	}
+
+	// if Alt DA is enabled and state allows, post the txdata to the DA Provider and replace it with the commitment.
+	if l.canUseAltDA() {
 		l.publishToAltDAAndL1(txdata, queue, receiptsCh, daGroup)
 		// we return nil to allow publishStateToL1 to keep processing the next txdata
 		return nil

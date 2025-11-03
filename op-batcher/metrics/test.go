@@ -5,6 +5,8 @@ type TestMetrics struct {
 	PendingBlocksBytesCurrent float64
 	ChannelQueueLength        int
 	pendingDABytes            float64
+	AltDAState                int
+	AltDAFailureCount         uint64
 }
 
 var _ Metricer = new(TestMetrics)
@@ -32,4 +34,12 @@ func (m *TestMetrics) ClearAllStateMetrics() {
 func (m *TestMetrics) RecordPendingBlockPruned(rawSize, daSize uint64) {
 	m.PendingBlocksBytesCurrent -= float64(rawSize)
 	m.pendingDABytes -= float64(daSize)
+}
+
+func (m *TestMetrics) RecordAltDAState(state int) {
+	m.AltDAState = state
+}
+
+func (m *TestMetrics) RecordAltDAFailureCount(count uint64) {
+	m.AltDAFailureCount = count
 }
