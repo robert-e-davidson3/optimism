@@ -481,18 +481,27 @@ func (l *BatchSubmitter) setTxPoolState(txPoolState TxPoolState, txPoolBlockedBl
 
 // canUseAltDA checks if AltDA should be used based on current state.
 // Returns true if AltDA is enabled and state is Good or Retrying.
+// If fallback is disabled, always returns true.
 func (l *BatchSubmitter) canUseAltDA() bool {
 	if !l.Config.UseAltDA {
 		return false
 	}
+	// If fallback is disabled, always use AltDA (retry forever)
+	if !l.Config.AltDAEnableFallback {
+		return true
+	}
 	l.altDAMutex.Lock()
 	defer l.altDAMutex.Unlock()
-	// Use AltDA if we're in Good state or actively Retrying
-	return l.altDAState == AltDAGood || l.altDAState == AltDARetrying
+	return l.altDAState != AltDADegraded
 }
 
 // recordAltDASuccess records a successful AltDA write and resets state to Good.
+// Only used when fallback is enabled.
 func (l *BatchSubmitter) recordAltDASuccess() {
+	if !l.Config.AltDAEnableFallback {
+		return // No tracking when fallback disabled
+	}
+
 	l.altDAMutex.Lock()
 	defer l.altDAMutex.Unlock()
 
@@ -512,7 +521,12 @@ func (l *BatchSubmitter) recordAltDASuccess() {
 }
 
 // recordAltDAFailure records an AltDA failure and potentially transitions to Degraded state.
+// Only used when fallback is enabled.
 func (l *BatchSubmitter) recordAltDAFailure() {
+	if !l.Config.AltDAEnableFallback {
+		return // No tracking when fallback disabled (retry forever)
+	}
+
 	l.altDAMutex.Lock()
 	defer l.altDAMutex.Unlock()
 
@@ -1080,7 +1094,7 @@ func (l *BatchSubmitter) sendTransaction(txdata txData, queue *txmgr.Queue[txRef
 	var err error
 
 	// Check if we should retry AltDA (transition from Degraded to Retrying)
-	if l.Config.UseAltDA && l.shouldRetryAltDA() {
+	if l.Config.UseAltDA && l.Config.AltDAEnableFallback && l.shouldRetryAltDA() {
 		l.transitionToRetrying()
 	}
 

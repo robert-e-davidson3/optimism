@@ -45,6 +45,7 @@ type BatcherConfig struct {
 	// maximum number of concurrent blob put requests to the DA server
 	MaxConcurrentDARequests uint64
 	// AltDA fallback configuration
+	AltDAEnableFallback     bool          // enable AltDA fallback mechanism (default false - retry forever like pre-patch)
 	AltDAFailureThreshold   uint64        // number of consecutive failures before falling back to L1-only
 	AltDARetryInterval      time.Duration // backoff interval before retrying AltDA after fallback
 
@@ -110,9 +111,10 @@ func (bs *BatcherService) initFromCLIConfig(ctx context.Context, version string,
 	bs.NetworkTimeout = cfg.TxMgrConfig.NetworkTimeout
 	bs.CheckRecentTxsDepth = cfg.CheckRecentTxsDepth
 	bs.WaitNodeSync = cfg.WaitNodeSync
-	// Set AltDA fallback defaults
-	bs.AltDAFailureThreshold = 5               // default: 5 consecutive failures
-	bs.AltDARetryInterval = 5 * time.Minute    // default: 5 minute backoff
+	// Set AltDA fallback configuration
+	bs.AltDAEnableFallback = cfg.AltDA.EnableFallback
+	bs.AltDAFailureThreshold = cfg.AltDA.FailureThreshold
+	bs.AltDARetryInterval = cfg.AltDA.RetryInterval
 
 	bs.ThrottleParams = config.ThrottleParams{
 		LowerThreshold:      cfg.ThrottleConfig.LowerThreshold,

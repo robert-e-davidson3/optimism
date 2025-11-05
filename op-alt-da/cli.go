@@ -17,6 +17,9 @@ var (
 	PutTimeoutFlagName            = altDAFlags("put-timeout")
 	GetTimeoutFlagName            = altDAFlags("get-timeout")
 	MaxConcurrentRequestsFlagName = altDAFlags("max-concurrent-da-requests")
+	EnableFallbackFlagName        = altDAFlags("enable-fallback")
+	FailureThresholdFlagName      = altDAFlags("failure-threshold")
+	RetryIntervalFlagName         = altDAFlags("retry-interval")
 )
 
 // altDAFlags returns the flag names for altDA
@@ -78,6 +81,27 @@ func CLIFlags(envPrefix string, category string) []cli.Flag {
 			EnvVars:  altDAEnvs(envPrefix, "MAX_CONCURRENT_DA_REQUESTS"),
 			Category: category,
 		},
+		&cli.BoolFlag{
+			Name:     EnableFallbackFlagName,
+			Usage:    "Enable AltDA fallback mechanism. When disabled (default), batcher retries AltDA forever on failure. When enabled, falls back to L1-only after threshold failures.",
+			Value:    false,
+			EnvVars:  altDAEnvs(envPrefix, "ENABLE_FALLBACK"),
+			Category: category,
+		},
+		&cli.Uint64Flag{
+			Name:     FailureThresholdFlagName,
+			Usage:    "Number of consecutive AltDA failures before falling back to L1-only writes (only used if enable-fallback is true)",
+			Value:    5,
+			EnvVars:  altDAEnvs(envPrefix, "FAILURE_THRESHOLD"),
+			Category: category,
+		},
+		&cli.DurationFlag{
+			Name:     RetryIntervalFlagName,
+			Usage:    "Time to wait before retrying AltDA after entering degraded state (only used if enable-fallback is true)",
+			Value:    5 * time.Minute,
+			EnvVars:  altDAEnvs(envPrefix, "RETRY_INTERVAL"),
+			Category: category,
+		},
 	}
 }
 
@@ -89,6 +113,9 @@ type CLIConfig struct {
 	PutTimeout            time.Duration
 	GetTimeout            time.Duration
 	MaxConcurrentRequests uint64
+	EnableFallback        bool
+	FailureThreshold      uint64
+	RetryInterval         time.Duration
 }
 
 func (c CLIConfig) Check() error {
@@ -116,5 +143,8 @@ func ReadCLIConfig(c cliiface.Context) CLIConfig {
 		PutTimeout:            c.Duration(PutTimeoutFlagName),
 		GetTimeout:            c.Duration(GetTimeoutFlagName),
 		MaxConcurrentRequests: c.Uint64(MaxConcurrentRequestsFlagName),
+		EnableFallback:        c.Bool(EnableFallbackFlagName),
+		FailureThreshold:      c.Uint64(FailureThresholdFlagName),
+		RetryInterval:         c.Duration(RetryIntervalFlagName),
 	}
 }

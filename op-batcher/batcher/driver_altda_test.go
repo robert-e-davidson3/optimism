@@ -27,6 +27,7 @@ func setupWithAltDA(t *testing.T, failureThreshold uint64, retryInterval time.Du
 		RollupConfig: cfg,
 		Config: BatcherConfig{
 			UseAltDA:                true,
+			AltDAEnableFallback:     true, // Enable fallback mechanism for these tests
 			AltDAFailureThreshold:   failureThreshold,
 			AltDARetryInterval:      retryInterval,
 			MaxConcurrentDARequests: 1,
