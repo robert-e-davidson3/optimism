@@ -217,19 +217,19 @@ var (
 		Value:    time.Second * 10,
 		Category: RollupCategory,
 	}
-	L2UnsafeOnly = &cli.BoolFlag{
-		Name:     "l2.unsafe-only",
-		Usage:    "Disable derivation",
-		EnvVars:  prefixEnvVars("L2_UNSAFE_ONLY"),
-		Category: RollupCategory,
-		Required: false,
-	}
 	L2FollowSource = &cli.StringFlag{
 		Name:     "l2.follow.source",
-		Usage:    "Address of L2 EL RPC HTTP endpoint to fetch safe/finalized blocks",
+		Usage:    "Address of L2 CL RPC HTTP endpoint to follow source",
 		EnvVars:  prefixEnvVars("L2_FOLLOW_SOURCE"),
 		Category: RollupCategory,
 		Required: false,
+	}
+	L2FollowSourceRpcTimeout = &cli.DurationFlag{
+		Name:     "l2.follow.source.rpc-timeout",
+		Usage:    "L2 follow source client rpc timeout",
+		EnvVars:  prefixEnvVars("L2_FOLLOW_SOURCE_RPC_TIMEOUT"),
+		Value:    time.Second * 10,
+		Category: RollupCategory,
 	}
 	VerifierL1Confs = &cli.Uint64Flag{
 		Name:     "verifier.l1-confs",
@@ -269,6 +269,15 @@ var (
 		Usage:    "Forces the sequencer to strictly prepare the next L1 origin and create empty L2 blocks",
 		EnvVars:  prefixEnvVars("SEQUENCER_RECOVER"),
 		Value:    false,
+		Category: SequencerCategory,
+	}
+	SequencerSealingDurationFlag = &cli.DurationFlag{
+		Name: "sequencer.sealing-duration",
+		Usage: "This is the amount of the time the sequencer allocates to sealing the block " +
+			"(i.e. it will fetch the payload from the execution engine this much prior to the block's timestamp). " +
+			"If this is <= 0 it is automatically adjusted to 50ms.",
+		EnvVars:  prefixEnvVars("SEQUENCER_SEALING_DURATION"),
+		Value:    50 * time.Millisecond,
 		Category: SequencerCategory,
 	}
 	FinalityLookbackFlag = &cli.Uint64Flag{
@@ -482,6 +491,7 @@ var optionalFlags = []cli.Flag{
 	SequencerMaxSafeLagFlag,
 	SequencerL1Confs,
 	SequencerRecoverMode,
+	SequencerSealingDurationFlag,
 	FinalityLookbackFlag,
 	FinalityDelayFlag,
 	L1EpochPollIntervalFlag,
@@ -500,7 +510,6 @@ var optionalFlags = []cli.Flag{
 	L1ChainConfig,
 	L2EngineKind,
 	L2EngineRpcTimeout,
-	L2UnsafeOnly,
 	L2FollowSource,
 	InteropRPCAddr,
 	InteropRPCPort,

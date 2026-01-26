@@ -2,7 +2,7 @@
 pragma solidity 0.8.15;
 
 // Testing
-import { Test } from "forge-std/Test.sol";
+import { Test } from "test/setup/Test.sol";
 
 // Contracts
 import { OPContractsManagerContainer } from "src/L1/opcm/OPContractsManagerContainer.sol";
@@ -40,8 +40,8 @@ contract OPContractsManagerContainer_TestInit is Test {
             anchorStateRegistryImpl: makeAddr("anchorStateRegistryImpl"),
             delayedWETHImpl: makeAddr("delayedWETHImpl"),
             mipsImpl: makeAddr("mipsImpl"),
-            faultDisputeGameV2Impl: makeAddr("faultDisputeGameV2Impl"),
-            permissionedDisputeGameV2Impl: makeAddr("permissionedDisputeGameV2Impl"),
+            faultDisputeGameImpl: makeAddr("faultDisputeGameImpl"),
+            permissionedDisputeGameImpl: makeAddr("permissionedDisputeGameImpl"),
             superFaultDisputeGameImpl: makeAddr("superFaultDisputeGameImpl"),
             superPermissionedDisputeGameImpl: makeAddr("superPermissionedDisputeGameImpl"),
             storageSetterImpl: makeAddr("storageSetterImpl")

@@ -137,7 +137,7 @@ func CreateL1(logger log.Logger, fa *foundry.ArtifactsFS, srcFS *foundry.SourceM
 		PrevRandao:   cfg.L1GenesisBlockMixHash,
 		BlobHashes:   nil,
 	}
-	l1Host := script.NewHost(logger.New("role", "l1", "chain", cfg.ChainID), fa, srcFS, l1Context, script.WithCreate2Deployer())
+	l1Host := script.NewHost(logger.New("role", "l1", "chain", cfg.ChainID), fa, srcFS, l1Context, script.WithCreate2Deployer(), script.WithNoMaxCodeSize())
 	return l1Host
 }
 
@@ -254,6 +254,7 @@ func DeployL2ToL1(l1Host *script.Host, superCfg *SuperchainConfig, superDeployme
 		AllowCustomDisputeParameters: true,
 		OperatorFeeScalar:            cfg.GasPriceOracleOperatorFeeScalar,
 		OperatorFeeConstant:          cfg.GasPriceOracleOperatorFeeConstant,
+		SuperchainConfig:             superDeployment.SuperchainConfigProxy,
 		UseCustomGasToken:            cfg.UseCustomGasToken,
 	})
 	if err != nil {
@@ -285,19 +286,25 @@ func MigrateInterop(
 	// We don't have a super root at genesis. But stub the starting anchor root anyways to facilitate super DG testing.
 	startingAnchorRoot := common.Hash(opcm.PermissionedGameStartingAnchorRoot)
 	imi := manage.InteropMigrationInput{
-		Prank:                          superCfg.ProxyAdminOwner,
-		Opcm:                           superDeployment.Opcm,
-		UsePermissionlessGame:          true,
-		StartingAnchorRoot:             startingAnchorRoot,
-		StartingAnchorL2SequenceNumber: big.NewInt(int64(l1GenesisTimestamp)),
-		Proposer:                       l2Cfgs[l2ChainID].Proposer,
-		Challenger:                     l2Cfgs[l2ChainID].Challenger,
-		MaxGameDepth:                   l2Cfgs[l2ChainID].DisputeMaxGameDepth,
-		SplitDepth:                     l2Cfgs[l2ChainID].DisputeSplitDepth,
-		InitBond:                       big.NewInt(0),
-		ClockExtension:                 l2Cfgs[l2ChainID].DisputeClockExtension,
-		MaxClockDuration:               l2Cfgs[l2ChainID].DisputeMaxClockDuration,
-		EncodedChainConfigs:            chainConfigs,
+		Prank: superCfg.ProxyAdminOwner,
+		Opcm:  superDeployment.Opcm,
+		MigrateInputV1: &manage.MigrateInputV1{
+			UsePermissionlessGame: true,
+			StartingAnchorRoot: manage.Proposal{
+				Root:             startingAnchorRoot,
+				L2SequenceNumber: big.NewInt(int64(l1GenesisTimestamp)),
+			},
+			GameParameters: manage.GameParameters{
+				Proposer:         l2Cfgs[l2ChainID].Proposer,
+				Challenger:       l2Cfgs[l2ChainID].Challenger,
+				MaxGameDepth:     l2Cfgs[l2ChainID].DisputeMaxGameDepth,
+				SplitDepth:       l2Cfgs[l2ChainID].DisputeSplitDepth,
+				InitBond:         big.NewInt(0),
+				ClockExtension:   l2Cfgs[l2ChainID].DisputeClockExtension,
+				MaxClockDuration: l2Cfgs[l2ChainID].DisputeMaxClockDuration,
+			},
+			OpChainConfigs: chainConfigs,
+		},
 	}
 	output, err := manage.Migrate(l1Host, imi)
 	if err != nil {

@@ -200,10 +200,9 @@ func WithOpReth(id stack.L2ELNodeID, opts ...L2ELOption) stack.Option[*Orchestra
 		useInterop := l2Net.genesis.Config.InteropTime != nil
 
 		supervisorRPC := ""
-		if useInterop {
-			require.NotNil(cfg.SupervisorID, "supervisor is required for interop")
+		if useInterop && cfg.SupervisorID != nil {
 			sup, ok := orch.supervisors.Get(*cfg.SupervisorID)
-			require.True(ok, "supervisor is required for interop")
+			require.True(ok, "supervisor not found")
 			supervisorRPC = sup.UserRPC()
 		}
 
@@ -265,12 +264,9 @@ func WithOpReth(id stack.L2ELNodeID, opts ...L2ELOption) stack.Option[*Orchestra
 		}
 
 		if areMetricsEnabled() {
-			// NB: Instead of getAvailableLocalPort, we should pass "0" so the OS picks its
-			// own port, but that is not currently logged properly so we cannot parse it.
-			// See: https://github.com/op-rs/op-reth/issues/333
-			metricsPort, err := getAvailableLocalPort()
-			p.Require().NoError(err, "WithOpReth: getting metrics port")
-			args = append(args, "--metrics="+metricsPort)
+			// Use port 0 to let the OS assign a port atomically at bind time.
+			// The actual port will be discovered by parsing the process logs.
+			args = append(args, "--metrics=127.0.0.1:0")
 		}
 
 		if supervisorRPC != "" {

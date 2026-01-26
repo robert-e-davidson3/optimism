@@ -25,6 +25,13 @@ If the PR modifies `OPContractsManagerV2.sol` and changes the `version` constant
 
 This section applies to Solidity files ONLY.
 
+### @dev Comments
+
+- Pay close attention to `@dev` natspec comments in the codebase
+- These comments often contain important invariants, requirements, or reminders for developers
+- When reviewing changes to a function, check if there are `@dev` comments that specify conditions or actions that must be taken when modifying that code
+- Flag violations of instructions in `@dev` comments (e.g., "when updating this function, also update X")
+
 ### Style Guide
 
 - Follow the style guide found at `.cursor/rules/solidity-styles.mdc` in the root of this repository.
@@ -52,3 +59,15 @@ This section applies to Solidity files ONLY.
   ```
 - Do NOT suggest removing the return value checking on low-level calls following `vm.expectRevert`
 - DO flag if `vm.expectRevert` is used with low-level calls but the return value is not captured and asserted
+
+### Foundry Version Bump Warnings
+
+If the PR changes the Foundry dependency versions, i.e the `forge`, `cast`, and `anvil` versions in `mise.toml`, it MUST also include a reference to the approved and merged design document that approves these foundry versions for usage in the PR description. Otherwise, you MUST leave a prominent comment on the PR with the following message:
+
+> ⚠️ **Foundry Version Bump Without Design Document**
+>
+> This PR includes a change to the Foundry dependency versions, i.e the `forge`, `cast`, and `anvil` versions in `mise.toml`.
+>
+> Please include a reference to the approved and merged design document that approves these foundry versions for usage in the PR description. Otherwise, the PR will not be approved.
+>
+> For more information on the Foundry version upgrade process, please see the [Foundry version upgrade policy](https://github.com/ethereum-optimism/optimism/blob/develop/packages/contracts-bedrock/book/src/policies/foundry-upgrades.md).

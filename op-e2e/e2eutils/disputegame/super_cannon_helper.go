@@ -18,6 +18,7 @@ import (
 	gameTypes "github.com/ethereum-optimism/optimism/op-challenger/game/types"
 	"github.com/ethereum-optimism/optimism/op-challenger/metrics"
 	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils/challenger"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum-optimism/optimism/op-service/sources/batching/rpcblock"
 	"github.com/ethereum-optimism/optimism/op-service/testlog"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -32,7 +33,7 @@ type SuperCannonGameHelper struct {
 	CannonHelper
 }
 
-func NewSuperCannonGameHelper(t *testing.T, client *ethclient.Client, opts *bind.TransactOpts, key *ecdsa.PrivateKey, game contracts.FaultDisputeGameContract, factoryAddr common.Address, gameAddr common.Address, provider *super.SuperTraceProvider, system DisputeSystem) *SuperCannonGameHelper {
+func NewSuperCannonGameHelper(t *testing.T, client *ethclient.Client, opts *bind.TransactOpts, key *ecdsa.PrivateKey, game contracts.FaultDisputeGameContract, factoryAddr common.Address, gameAddr common.Address, provider super.SuperTraceProvider, system DisputeSystem) *SuperCannonGameHelper {
 	superGameHelper := NewSuperGameHelper(t, require.New(t), client, opts, key, game, factoryAddr, gameAddr, provider, system)
 	defaultChallengerOptions := func() []challenger.Option {
 		return []challenger.Option{
@@ -75,6 +76,7 @@ func (g *SuperCannonGameHelper) CreateHonestActor(ctx context.Context, options .
 		vm.NewOpProgramServerExecutor(logger),
 		prestateProvider,
 		supervisorClient,
+		nil,
 		cfg.CannonAbsolutePreState,
 		dir,
 		l1Head,
@@ -103,7 +105,7 @@ func (g *SuperCannonGameHelper) ChallengeToPreimageLoad(ctx context.Context, top
 
 	splitDepth := g.splitGame.SplitDepth(ctx)
 	execDepth := g.splitGame.ExecDepth(ctx)
-	g.require.NotEqual(topGameLeaf.Position.TraceIndex(execDepth).Uint64(), targetTraceIndex, "cannot move to defend a terminal trace index")
+	g.require.NotEqual(bigs.Uint64Strict(topGameLeaf.Position.TraceIndex(execDepth)), targetTraceIndex, "cannot move to defend a terminal trace index")
 	g.require.EqualValues(splitDepth+1, topGameLeaf.Depth(), "supplied claim must be the root of an execution game")
 	g.require.EqualValues(execDepth%2, 0, "execution game depth must be even") // since we're supporting the execution root claim
 
@@ -183,7 +185,7 @@ func (g *SuperCannonGameHelper) createSuperCannonTraceProvider(ctx context.Conte
 	return translatingProvider.Original().(*cannon.CannonTraceProviderForTest)
 }
 
-func (g *SuperCannonGameHelper) createSuperTraceProvider(ctx context.Context) *super.SuperTraceProvider {
+func (g *SuperCannonGameHelper) createSuperTraceProvider(ctx context.Context) super.SuperTraceProvider {
 	logger := testlog.Logger(g.t, log.LevelInfo).New("role", "superTraceProvider", "game", g.splitGame.Addr)
 	rootProvider := g.System.SupervisorClient()
 	splitDepth := g.splitGame.SplitDepth(ctx)
@@ -193,7 +195,7 @@ func (g *SuperCannonGameHelper) createSuperTraceProvider(ctx context.Context) *s
 	prestateProvider := super.NewSuperRootPrestateProvider(rootProvider, prestateTimestamp)
 	rollupCfgs, err := super.NewRollupConfigsFromParsed(g.System.RollupCfgs()...)
 	require.NoError(g.T, err, "failed to create rollup configs")
-	return super.NewSuperTraceProvider(logger, rollupCfgs, prestateProvider, rootProvider, l1Head, splitDepth, prestateTimestamp, poststateTimestamp)
+	return super.NewSupervisorSuperTraceProvider(logger, rollupCfgs, prestateProvider, rootProvider, l1Head, splitDepth, prestateTimestamp, poststateTimestamp)
 }
 
 // InitFirstDerivationGame builds a top-level game whose deepest node (at splitDepth) asserts the first

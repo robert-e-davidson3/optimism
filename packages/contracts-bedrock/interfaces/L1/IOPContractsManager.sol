@@ -210,8 +210,8 @@ interface IOPContractsManager {
         address anchorStateRegistryImpl;
         address delayedWETHImpl;
         address mipsImpl;
-        address faultDisputeGameV2Impl;
-        address permissionedDisputeGameV2Impl;
+        address faultDisputeGameImpl;
+        address permissionedDisputeGameImpl;
         address superFaultDisputeGameImpl;
         address superPermissionedDisputeGameImpl;
     }
@@ -299,6 +299,8 @@ interface IOPContractsManager {
     error PrestateRequired();
 
     error InvalidDevFeatureAccess(bytes32 devFeature);
+
+    error OPContractsManager_V2Enabled();
 
     // -------- Methods --------
 

@@ -13,6 +13,8 @@ import { Process } from "scripts/libraries/Process.sol";
 import { Config } from "scripts/libraries/Config.sol";
 import { Bytes } from "src/libraries/Bytes.sol";
 import { DevFeatures } from "src/libraries/DevFeatures.sol";
+import { SemverComp } from "src/libraries/SemverComp.sol";
+import { Constants } from "src/libraries/Constants.sol";
 
 // Interfaces
 import { IOPContractsManager } from "interfaces/L1/IOPContractsManager.sol";
@@ -43,6 +45,9 @@ contract VerifyOPCM is Script {
 
     /// @notice Thrown when contractsContainer addresses are not the same across all OPCM components.
     error VerifyOPCM_ContractsContainerMismatch();
+
+    /// @notice Thrown when opcmUtils addresses are not the same across all OPCM components that have it.
+    error VerifyOPCM_OpcmUtilsMismatch();
 
     /// @notice Thrown when the creation bytecode is not found in an artifact file.
     error VerifyOPCM_CreationBytecodeNotFound(string _artifactPath);
@@ -114,8 +119,8 @@ contract VerifyOPCM is Script {
         fieldNameOverrides["optimismPortalInteropImpl"] = "OptimismPortalInterop";
         fieldNameOverrides["mipsImpl"] = "MIPS64";
         fieldNameOverrides["ethLockboxImpl"] = "ETHLockbox";
-        fieldNameOverrides["faultDisputeGameV2Impl"] = "FaultDisputeGameV2";
-        fieldNameOverrides["permissionedDisputeGameV2Impl"] = "PermissionedDisputeGameV2";
+        fieldNameOverrides["faultDisputeGameImpl"] = "FaultDisputeGame";
+        fieldNameOverrides["permissionedDisputeGameImpl"] = "PermissionedDisputeGame";
         fieldNameOverrides["permissionlessDisputeGame1"] = "FaultDisputeGame";
         fieldNameOverrides["permissionlessDisputeGame2"] = "FaultDisputeGame";
         fieldNameOverrides["permissionedDisputeGame1"] = "PermissionedDisputeGame";
@@ -126,11 +131,22 @@ contract VerifyOPCM is Script {
         fieldNameOverrides["superPermissionedDisputeGame2"] = "SuperPermissionedDisputeGame";
         fieldNameOverrides["opcmGameTypeAdder"] = "OPContractsManagerGameTypeAdder";
         fieldNameOverrides["opcmDeployer"] = "OPContractsManagerDeployer";
+        fieldNameOverrides["opcmMigrator"] = "OPContractsManagerMigrator";
         fieldNameOverrides["opcmUpgrader"] = "OPContractsManagerUpgrader";
         fieldNameOverrides["opcmInteropMigrator"] = "OPContractsManagerInteropMigrator";
         fieldNameOverrides["opcmStandardValidator"] = "OPContractsManagerStandardValidator";
+
+        // Since both OPCM V1 and V2 have contractsContainer var and they point to different contract file names,
+        // in the code logic, we rename any occurrences of it to "contractsContainerV1" or "contractsContainerV2" before
+        // using it to read the mapping.
+        fieldNameOverrides["contractsContainerV1"] = "OPContractsManagerContractsContainer";
+        fieldNameOverrides["contractsContainerV2"] = "OPContractsManagerContainer";
+
+        // OPCM V2 Specific field name overrides.
+        fieldNameOverrides["standardValidator"] = "OPContractsManagerStandardValidator";
+        fieldNameOverrides["storageSetterImpl"] = "StorageSetter";
         fieldNameOverrides["opcmV2"] = "OPContractsManagerV2";
-        fieldNameOverrides["contractsContainer"] = "OPContractsManagerContractsContainer";
+        fieldNameOverrides["opcmUtils"] = "OPContractsManagerUtils";
 
         // Overrides for situations where contracts have differently named source files.
         sourceNameOverrides["OPContractsManagerGameTypeAdder"] = "OPContractsManager";
@@ -155,13 +171,19 @@ contract VerifyOPCM is Script {
         expectedGetters["opcmDeployer"] = "SKIP"; // Address verified via bytecode comparison
         expectedGetters["opcmGameTypeAdder"] = "SKIP"; // Address verified via bytecode comparison
         expectedGetters["opcmInteropMigrator"] = "SKIP"; // Address verified via bytecode comparison
+        expectedGetters["opcmMigrator"] = "SKIP"; // Address verified via bytecode comparison
         expectedGetters["opcmStandardValidator"] = "SKIP"; // Address verified via bytecode comparison
         expectedGetters["opcmUpgrader"] = "SKIP"; // Address verified via bytecode comparison
+
+        // OPCM V2 Specific expected getters overrides
         expectedGetters["opcmV2"] = "SKIP"; // Address verified via bytecode comparison
+        expectedGetters["opcmUtils"] = "SKIP"; // Address verified via bytecode comparison
+        expectedGetters["contractsContainer"] = "SKIP"; // Address verified via bytecode comparison
 
         // Getters that don't need any sort of verification
         expectedGetters["devFeatureBitmap"] = "SKIP";
         expectedGetters["isDevFeatureEnabled"] = "SKIP";
+        expectedGetters["version"] = "SKIP";
 
         // Mark as ready.
         ready = true;
@@ -249,6 +271,9 @@ contract VerifyOPCM is Script {
         // Verify that all component contracts have the same contractsContainer address.
         _verifyContractsContainerConsistency(propRefs);
 
+        // Verify that all component contracts that have opcmUtils() have the same address.
+        _verifyOpcmUtilsConsistency(propRefs);
+
         // Get the ContractsContainer address from the first component (they're all the same)
         address contractsContainerAddr = address(0);
         for (uint256 i = 0; i < propRefs.length; i++) {
@@ -277,10 +302,10 @@ contract VerifyOPCM is Script {
             new OpcmContractRef[](propRefs.length + implRefs.length + bpRefs.length + extraRefs);
 
         // References for OPCM and linked contracts.
-        refs[0] = OpcmContractRef({ field: "opcm", name: "OPContractsManager", addr: address(_opcm), blueprint: false });
+        refs[0] = OpcmContractRef({ field: "opcm", name: _opcmContractName(), addr: address(_opcm), blueprint: false });
         refs[1] = OpcmContractRef({
             field: "contractsContainer",
-            name: "OPContractsManagerContractsContainer",
+            name: _isOPCMV2() ? "OPContractsManagerContainer" : "OPContractsManagerContractsContainer",
             addr: contractsContainerAddr,
             blueprint: false
         });
@@ -388,6 +413,81 @@ contract VerifyOPCM is Script {
             return address(0);
         }
         return abi.decode(returnData, (address));
+    }
+
+    /// @notice Checks if a field name represents an OPCM component contract that has opcmUtils().
+    /// @param _field The field name to check.
+    /// @return True if the field represents an OPCM component with opcmUtils(), false otherwise.
+    function _hasOpcmUtils(string memory _field) internal pure returns (bool) {
+        // Only opcmV2 and opcmMigrator have opcmUtils() via OPContractsManagerUtilsCaller
+        return LibString.eq(_field, "opcmV2") || LibString.eq(_field, "opcmMigrator");
+    }
+
+    /// @notice Gets the opcmUtils address from a contract.
+    /// @param _contract The contract address to query.
+    /// @return The opcmUtils address.
+    function _getOpcmUtilsAddress(address _contract) internal view returns (address) {
+        // Call the opcmUtils() function on the contract.
+        // nosemgrep: sol-style-use-abi-encodecall
+        (bool success, bytes memory returnData) = _contract.staticcall(abi.encodeWithSignature("opcmUtils()"));
+        if (!success) {
+            console.log(
+                string.concat("[FAIL] ERROR: Failed to call opcmUtils() function on contract ", vm.toString(_contract))
+            );
+            return address(0);
+        }
+        return abi.decode(returnData, (address));
+    }
+
+    /// @notice Verifies that all OPCM component contracts that have opcmUtils() have the same address.
+    /// @param _propRefs Array of property references containing component addresses.
+    function _verifyOpcmUtilsConsistency(OpcmContractRef[] memory _propRefs) internal view {
+        // Process components that have opcmUtils(), validate addresses, and verify consistency
+        OpcmContractRef[] memory components = new OpcmContractRef[](_propRefs.length);
+        address[] memory utilsAddresses = new address[](_propRefs.length);
+        uint256 componentCount = 0;
+        address expectedUtils = address(0);
+
+        for (uint256 i = 0; i < _propRefs.length; i++) {
+            OpcmContractRef memory propRef = _propRefs[i];
+
+            if (!_hasOpcmUtils(propRef.field)) {
+                continue;
+            }
+
+            components[componentCount] = propRef;
+            address utilsAddr = _getOpcmUtilsAddress(propRef.addr);
+
+            if (utilsAddr == address(0)) {
+                console.log(string.concat("ERROR: Failed to retrieve opcmUtils address from ", propRef.field));
+                revert VerifyOPCM_OpcmUtilsMismatch();
+            }
+
+            utilsAddresses[componentCount] = utilsAddr;
+
+            if (componentCount == 0) {
+                expectedUtils = utilsAddr;
+            } else if (utilsAddr != expectedUtils) {
+                console.log("ERROR: opcmUtils addresses are not consistent across all components");
+                for (uint256 j = 0; j <= componentCount; j++) {
+                    console.log(string.concat("  ", components[j].field, ": ", vm.toString(utilsAddresses[j])));
+                }
+                revert VerifyOPCM_OpcmUtilsMismatch();
+            }
+
+            componentCount++;
+        }
+
+        // Ensure we found at least one component
+        if (componentCount == 0) {
+            console.log("OK: No OPCM components with opcmUtils() found (skipping verification)");
+            return;
+        }
+
+        console.log(
+            string.concat("OK: All ", vm.toString(componentCount), " components have the same opcmUtils address")
+        );
+        console.log(string.concat("  opcmUtils: ", vm.toString(expectedUtils)));
     }
 
     /// @notice Verifies a single OPCM contract reference (implementation or bytecode).
@@ -553,21 +653,6 @@ contract VerifyOPCM is Script {
     function _isSuperDisputeGamesEnabled(IOPContractsManager _opcm) internal view returns (bool) {
         bytes32 bitmap = _opcm.devFeatureBitmap();
         return DevFeatures.isDevFeatureEnabled(bitmap, DevFeatures.OPTIMISM_PORTAL_INTEROP);
-    }
-
-    /// @notice Checks if a contract is a V1 dispute game implementation.
-    /// @param _contractName The name to check.
-    /// @return True if this is a V1 dispute game.
-    function _isV1DisputeGameImplementation(string memory _contractName) internal pure returns (bool) {
-        return LibString.eq(_contractName, "FaultDisputeGame") || LibString.eq(_contractName, "PermissionedDisputeGame");
-    }
-
-    /// @notice Checks if a contract is a V2 dispute game implementation.
-    /// @param _contractName The name to check.
-    /// @return True if this is a V2 dispute game.
-    function _isV2DisputeGameImplementation(string memory _contractName) internal pure returns (bool) {
-        return LibString.eq(_contractName, "FaultDisputeGameV2")
-            || LibString.eq(_contractName, "PermissionedDisputeGameV2");
     }
 
     /// @notice Checks if a contract is a Super dispute game implementation.
@@ -756,7 +841,7 @@ contract VerifyOPCM is Script {
     }
 
     /// @notice Uses the OPContractsManager ABI JSON and the live OPCM contract to extract a list
-    ///         of contract names and their corresonding addresses for the various immutable
+    ///         of contract names and their corresponding addresses for the various immutable
     ///         references to other OPCM contracts.
     /// @param _opcm The live OPCM contract.
     /// @return Array of OpcmContractRef structs containing contract names/addresses.
@@ -767,7 +852,7 @@ contract VerifyOPCM is Script {
                 Process.bash(
                     string.concat(
                         "jq -r '[.abi[] | select(.name? and (.name | type == \"string\") and (.name | startswith(\"opcm\"))) | .name]' ",
-                        _buildArtifactPath("OPContractsManager")
+                        _buildArtifactPath(_opcmContractName())
                     )
                 )
             ),
@@ -824,7 +909,7 @@ contract VerifyOPCM is Script {
                         "jq -r '[.abi[] | select(.name == \"",
                         _property,
                         "\") | .outputs[0].components[].name]' ",
-                        _buildArtifactPath("OPContractsManager")
+                        _buildArtifactPath(_opcmContractName())
                     )
                 )
             ),
@@ -869,6 +954,10 @@ contract VerifyOPCM is Script {
     /// @param _fieldName The field name to convert.
     /// @return The contract name.
     function _getContractNameFromFieldName(string memory _fieldName) internal view returns (string memory) {
+        if (LibString.eq(_fieldName, "contractsContainer")) {
+            _fieldName = _isOPCMV2() ? "contractsContainerV2" : "contractsContainerV1";
+        }
+
         // Check for an explicit override
         string memory overrideName = fieldNameOverrides[_fieldName];
         if (bytes(overrideName).length > 0) {
@@ -993,7 +1082,7 @@ contract VerifyOPCM is Script {
                 Process.bash(
                     string.concat(
                         "jq -r '[.abi[] | select(.type == \"function\" and .stateMutability == \"view\" and (.inputs | length) == 0) | .name]' ",
-                        _buildArtifactPath("OPContractsManager")
+                        _buildArtifactPath(_opcmContractName())
                     )
                 )
             ),
@@ -1045,5 +1134,35 @@ contract VerifyOPCM is Script {
             }
             revert VerifyOPCM_UnaccountedGetters(trimmedUnaccounted);
         }
+    }
+
+    /// @notice Returns the name of the OPCM contract depending on whether the OPCM is V2.
+    /// @return The name of the OPCM contract.
+    function _opcmContractName() internal view returns (string memory) {
+        return _isOPCMV2() ? "OPContractsManagerV2" : "OPContractsManager";
+    }
+
+    /// @notice Checks if the OPCM is V2.
+    /// @dev If the OPCM address is not set, default to false.
+    /// @return True if the OPCM is V2, false otherwise.
+    function _isOPCMV2() internal view returns (bool) {
+        // Get the OPCM contract address from the environment variables.
+        address opcmAddress = _getOPCMAddress();
+
+        // If the OPCM contract address is not set, default to V1.
+        if (opcmAddress == address(0)) {
+            return false;
+        }
+
+        // If the OPCM contract version is greater than or equal to 7.0.0, then it is OPCM V2.
+        return SemverComp.gte(IOPContractsManager(opcmAddress).version(), Constants.OPCM_V2_MIN_VERSION);
+    }
+
+    /// @notice Gets the address of the OPCM contract from the environment variables.
+    /// @dev If not set, default to address(0).
+    /// @return The address of the OPCM contract.
+    function _getOPCMAddress() internal view returns (address) {
+        // nosemgrep: sol-style-vm-env-only-in-config-sol
+        return vm.envOr("OPCM_ADDRESS", address(0));
     }
 }

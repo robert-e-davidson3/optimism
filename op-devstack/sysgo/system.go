@@ -1,9 +1,6 @@
 package sysgo
 
 import (
-	"os"
-	"strings"
-
 	"github.com/ethereum-optimism/optimism/op-chain-ops/devkeys"
 	"github.com/ethereum-optimism/optimism/op-deployer/pkg/deployer"
 	"github.com/ethereum-optimism/optimism/op-devstack/stack"
@@ -340,6 +337,47 @@ func DefaultSingleChainInteropSystem(dest *DefaultSingleChainInteropSystemIDs) s
 	return opt
 }
 
+// DefaultMinimalInteropSystem creates a minimal system with interop contracts but no supervisor.
+// This tests interop contract deployment with local finality (SupervisorEnabled=false in op-node).
+func DefaultMinimalInteropSystem(dest *DefaultMinimalSystemIDs) stack.Option[*Orchestrator] {
+	ids := NewDefaultMinimalSystemIDs(DefaultL1ID, DefaultL2AID)
+	opt := stack.Combine[*Orchestrator]()
+
+	opt.Add(stack.BeforeDeploy(func(o *Orchestrator) {
+		o.P().Logger().Info("Setting up minimal interop (no supervisor)")
+	}))
+
+	opt.Add(WithMnemonicKeys(devkeys.TestMnemonic))
+
+	opt.Add(WithDeployer(),
+		WithDeployerOptions(
+			WithLocalContractSources(),
+			WithCommons(ids.L1.ChainID()),
+			WithPrefundedL2(ids.L1.ChainID(), ids.L2.ChainID()),
+			WithInteropAtGenesis(),
+		),
+	)
+
+	opt.Add(WithL1Nodes(ids.L1EL, ids.L1CL))
+
+	// No supervisor - interop with local finality only
+	opt.Add(WithL2ELNode(ids.L2EL))
+	opt.Add(WithL2CLNode(ids.L2CL, ids.L1CL, ids.L1EL, ids.L2EL, L2CLSequencer()))
+	opt.Add(WithTestSequencer(ids.TestSequencer, ids.L1CL, ids.L2CL, ids.L1EL, ids.L2EL))
+	opt.Add(WithBatcher(ids.L2Batcher, ids.L1EL, ids.L2CL, ids.L2EL))
+	opt.Add(WithProposer(ids.L2Proposer, ids.L1EL, &ids.L2CL, nil))
+
+	opt.Add(WithFaucets([]stack.L1ELNodeID{ids.L1EL}, []stack.L2ELNodeID{ids.L2EL}))
+
+	opt.Add(WithL2MetricsDashboard())
+
+	opt.Add(stack.Finally(func(orch *Orchestrator) {
+		*dest = ids
+	}))
+
+	return opt
+}
+
 // baseInteropSystem defines a system that supports interop with a single chain
 // Components which are shared across multiple chains are not started, allowing them to be added later including
 // any additional chains that have been added.
@@ -605,7 +643,7 @@ func NewDefaultSingleChainSystemWithFlashblocksIDs(l1ID, l2ID eth.ChainID) Singl
 		L2:            stack.L2NetworkID(l2ID),
 		L2CL:          stack.NewL2CLNodeID("sequencer", l2ID),
 		L2EL:          stack.NewL2ELNodeID("sequencer", l2ID),
-		L2Builder:     stack.NewOPRBuilderNodeID("sequencer", l2ID),
+		L2Builder:     stack.NewOPRBuilderNodeID("sequencer-builder", l2ID),
 		L2RollupBoost: stack.NewRollupBoostNodeID("rollup-boost", l2ID),
 		L2Batcher:     stack.NewL2BatcherID("main", l2ID),
 		L2Proposer:    stack.NewL2ProposerID("main", l2ID),
@@ -623,24 +661,8 @@ func DefaultSingleChainSystemWithFlashblocks(dest *SingleChainSystemWithFlashblo
 func singleChainSystemWithFlashblocksOpts(ids *SingleChainSystemWithFlashblocksIDs, dest *SingleChainSystemWithFlashblocksIDs) stack.CombinedOption[*Orchestrator] {
 	opt := stack.Combine[*Orchestrator]()
 	// Precompute deterministic P2P identity and peering between sequencer EL and op-rbuilder EL.
-	seqID := NewELNodeIdentity("127.0.0.1", 0)
-	builderID := NewELNodeIdentity("127.0.0.1", 0) // allocate dynamic port for builder
-
-	var missingEnv []string
-	if os.Getenv("OP_RBUILDER_EXEC_PATH") == "" {
-		missingEnv = append(missingEnv, "OP_RBUILDER_EXEC_PATH")
-	}
-	if os.Getenv("ROLLUP_BOOST_EXEC_PATH") == "" {
-		missingEnv = append(missingEnv, "ROLLUP_BOOST_EXEC_PATH")
-	}
-	if len(missingEnv) > 0 {
-		missing := strings.Join(missingEnv, ", ")
-		opt.Add(stack.BeforeDeploy(func(o *Orchestrator) {
-			o.P().Logger().Warn("Skipping single-chain flashblocks system; missing executables", "missing_env", missing)
-			o.P().SkipNow()
-		}))
-		return opt
-	}
+	seqID := NewELNodeIdentity(0)
+	builderID := NewELNodeIdentity(0) // allocate dynamic port for builder
 
 	opt.Add(stack.BeforeDeploy(func(o *Orchestrator) {
 		o.P().Logger().Info("Setting up")
@@ -658,8 +680,12 @@ func singleChainSystemWithFlashblocksOpts(ids *SingleChainSystemWithFlashblocksI
 
 	opt.Add(WithL1Nodes(ids.L1EL, ids.L1CL))
 
-	opt.Add(WithL2ELNode(ids.L2EL, L2ELWithP2PConfig("127.0.0.1", seqID.Port, seqID.KeyHex(), []string{builderID.Enode}, nil)))
-	opt.Add(WithOPRBuilderNode(ids.L2Builder, OPRBuilderWithNodeIdentity(builderID, "127.0.0.1", []string{seqID.Enode}, []string{seqID.Enode})))
+	opt.Add(WithL2ELNode(ids.L2EL, L2ELWithP2PConfig("127.0.0.1", seqID.Port, seqID.KeyHex(), nil, nil)))
+	opt.Add(WithOPRBuilderNode(ids.L2Builder, OPRBuilderWithNodeIdentity(builderID, "127.0.0.1", nil, nil)))
+	// Sequencer adds builder as regular static peer (not trusted)
+	opt.Add(WithL2ELP2PConnection(ids.L2EL, stack.L2ELNodeID(ids.L2Builder), false))
+	// Builder adds sequencer as trusted peer
+	opt.Add(WithL2ELP2PConnection(stack.L2ELNodeID(ids.L2Builder), ids.L2EL, true))
 	opt.Add(WithRollupBoost(ids.L2RollupBoost, ids.L2EL, RollupBoostWithBuilderNode(ids.L2Builder)))
 
 	opt.Add(WithL2CLNode(ids.L2CL, ids.L1CL, ids.L1EL, stack.L2ELNodeID(ids.L2RollupBoost), L2CLSequencer()))
